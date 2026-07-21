@@ -35,3 +35,5 @@ installer/Output/
 Thumbs.db
 
 license.txt
+
+.installer
