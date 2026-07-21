@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec.bak
+
+# PyInstaller spec-файлы (сборочные конфиги)
+MergeCAD.spec
+MergeCAD_V1.spec
+MergeCAD_New.spec
+
+# PyInstaller-специфичные файлы сборки
+warn-*.txt
+xref-*.html
+*.toc
+base_library.zip
+
+# Установщик (Inno Setup и т.п.)
+installer/Output/
+*.exe
+
+# Локальные настройки/логи, если появятся
+*.log
+.env
+
+# Файлы IDE/ОС
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+license.txt
