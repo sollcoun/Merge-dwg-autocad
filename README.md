@@ -108,4 +108,9 @@ MergeCAD.ico          — иконка приложения
 
 ## Лицензия
 
-См. [`license.txt`](./license.txt).
+MergeCAD
+Version 1.0.0
+
+Copyright © 2026.
+
+Все права защищены.
