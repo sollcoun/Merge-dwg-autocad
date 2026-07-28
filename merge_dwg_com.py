@@ -14,6 +14,18 @@ merge_dwg_com.py
     трансформации, вместе со всеми зависимостями (слои, типы линий,
     веса линий, стили текста, блоки, атрибуты).
 
+Дополнительно (с этой версии):
+    Скрипт также умеет автоматически подхватывать растровые изображения с
+    привязкой в формате world file — пары файлов "картинка.bmp" +
+    "картинка.bpw", лежащие в исходной папке. Для каждой такой пары:
+        - читается .bpw (6 чисел — аффинные коэффициенты привязки);
+        - определяется размер BMP в пикселях (из заголовка файла);
+        - вычисляются координаты, поворот и масштаб изображения в мире;
+        - изображение вставляется в Model Space результирующего чертежа
+          сразу в правильном месте, с правильным размером/поворотом.
+    Ничего вручную указывать не нужно — достаточно, чтобы .bmp и .bpw
+    лежали рядом и назывались одинаково (кроме расширения).
+
 Требования:
     - Windows
     - Установленный AutoCAD (любая современная версия с COM-интерфейсом)
@@ -49,6 +61,7 @@ import argparse
 import glob
 import logging
 import os
+import struct
 import sys
 import time
 
@@ -162,6 +175,204 @@ def get_or_start_acad(visible: bool, logger: logging.Logger):
 def find_dwg_files(source_folder: str) -> list:
     pattern = os.path.join(source_folder, "**", "*.dwg")
     return sorted(glob.glob(pattern, recursive=True))
+
+
+# --------------------------------------------------------------------------
+# Растровые изображения с привязкой BMP + BPW (world file)
+# --------------------------------------------------------------------------
+def find_bmp_bpw_pairs_verbose(source_folder: str):
+    """
+    Ищет пары (image.bmp, image.bpw) в указанной папке (рекурсивно).
+    Возвращает (pairs, missing_bpw_paths):
+        pairs             — список (bmp_path, bpw_path) для файлов,
+                             у которых нашёлся .bpw;
+        missing_bpw_paths — .bmp-файлы, для которых .bpw не найден
+                             (просто картинка без привязки — пропускаем,
+                             т.к. корректно разместить её нечем).
+    """
+    pattern = os.path.join(source_folder, "**", "*.bmp")
+    bmp_files = sorted(glob.glob(pattern, recursive=True))
+
+    pairs = []
+    missing = []
+    for bmp_path in bmp_files:
+        stem, _ = os.path.splitext(bmp_path)
+        bpw_path = stem + ".bpw"
+        if not os.path.isfile(bpw_path):
+            # На случай другого регистра расширения (BPW/Bpw и т.п.)
+            candidates = glob.glob(stem + ".[bB][pP][wW]")
+            bpw_path = candidates[0] if candidates else None
+        if bpw_path and os.path.isfile(bpw_path):
+            pairs.append((bmp_path, bpw_path))
+        else:
+            missing.append(bmp_path)
+    return pairs, missing
+
+
+def find_bmp_bpw_pairs(source_folder: str) -> list:
+    """Короткая версия find_bmp_bpw_pairs_verbose — только найденные пары."""
+    pairs, _missing = find_bmp_bpw_pairs_verbose(source_folder)
+    return pairs
+
+
+def parse_bpw(bpw_path: str):
+    """
+    Читает world-файл (.bpw) — 6 чисел по одной на строку, задающих
+    аффинное преобразование "координата пикселя -> мировая координата":
+
+        x = A*col + B*row + C
+        y = D*col + E*row + F
+
+    где col/row — номер столбца/строки пикселя (0 — первый пиксель).
+    Порядок строк в файле — стандартный для world-файлов (.tfw/.jgw/.bpw):
+
+        строка 1: A — размер пикселя по X
+        строка 2: D — поворот (участвует в формуле Y)
+        строка 3: B — поворот (участвует в формуле X)
+        строка 4: E — размер пикселя по Y (обычно отрицательный)
+        строка 5: C — X координата центра верхнего левого пикселя
+        строка 6: F — Y координата центра верхнего левого пикселя
+
+    Если поворота нет (самый частый случай, B = D = 0), порядок строк 2 и 3
+    не влияет на результат — оба значения нулевые.
+    """
+    with open(bpw_path, "r", encoding="utf-8-sig") as f:
+        values = [float(line.strip()) for line in f if line.strip()]
+    if len(values) < 6:
+        raise ValueError(
+            f"Файл '{bpw_path}' содержит {len(values)} значений вместо 6")
+    A, D, B, E, C, F = values[:6]
+    return A, D, B, E, C, F
+
+
+def read_bmp_pixel_size(bmp_path: str):
+    """
+    Определяет ширину/высоту BMP-файла в пикселях напрямую из заголовка
+    файла, без внешних зависимостей (PIL и т.п.). Поддерживает и
+    современный BITMAPINFOHEADER (40+ байт, ширина/высота — int32 со
+    знаком), и старый OS/2 BITMAPCOREHEADER (12 байт, uint16). Отрицательная
+    высота означает "top-down" BMP (строки сверху вниз) — для наших целей
+    важно только количество пикселей, поэтому берём модуль.
+    """
+    with open(bmp_path, "rb") as f:
+        header = f.read(26)
+    if len(header) < 26 or header[0:2] != b"BM":
+        raise ValueError(f"Файл '{bmp_path}' не похож на корректный BMP")
+
+    dib_header_size = struct.unpack_from("<I", header, 14)[0]
+    if dib_header_size == 12:
+        width, height = struct.unpack_from("<HH", header, 18)
+    else:
+        width, height = struct.unpack_from("<ii", header, 18)
+        height = abs(height)
+    return width, height
+
+
+def _bpw_pixel_to_world(A, B, C, D, E, F, col, row):
+    x = A * col + B * row + C
+    y = D * col + E * row + F
+    return (x, y)
+
+
+def compute_image_world_corners(A, D, B, E, C, F, width_px, height_px):
+    """
+    Возвращает мировые координаты трёх углов изображения, нужных для
+    построения аффинной трансформации: нижний левый (BL), нижний правый
+    (BR) и верхний левый (TL). Используется смещение в полпикселя, т.к.
+    C/F в .bpw задают координаты ЦЕНТРА крайнего пикселя, а нам нужен
+    внешний контур изображения целиком.
+    """
+    tl = _bpw_pixel_to_world(A, B, C, D, E, F, -0.5, -0.5)
+    tr = _bpw_pixel_to_world(A, B, C, D, E, F, width_px - 0.5, -0.5)
+    br = _bpw_pixel_to_world(A, B, C, D, E, F, width_px - 0.5, height_px - 0.5)
+    bl = _bpw_pixel_to_world(A, B, C, D, E, F, -0.5, height_px - 0.5)
+    return {"TL": tl, "TR": tr, "BR": br, "BL": bl}
+
+
+def _build_affine_transform_matrix(native_min, native_max, world_bl, world_br, world_tl):
+    """
+    Строит 4x4 матрицу трансформации для AcadEntity.TransformBy, которая
+    переводит только что вставленное (AddRaster, масштаб 1, поворот 0)
+    изображение из его "естественного" положения (нижний левый угол —
+    native_min, без поворота) в целевой прямоугольник, заданный тремя
+    мировыми координатами углов. Так поддерживается полный аффинный
+    случай — произвольный поворот и РАЗНЫЙ масштаб по X/Y (в отличие от
+    свойства ScaleFactor у RasterImage, которое масштабирует только
+    равномерно и не умеет поворот+неравномерный масштаб одновременно).
+    """
+    native_width = native_max[0] - native_min[0]
+    native_height = native_max[1] - native_min[1]
+    if abs(native_width) < 1e-12 or abs(native_height) < 1e-12:
+        return None
+
+    rel_br = (world_br[0] - world_bl[0], world_br[1] - world_bl[1])
+    rel_tl = (world_tl[0] - world_bl[0], world_tl[1] - world_bl[1])
+
+    l00 = rel_br[0] / native_width
+    l10 = rel_br[1] / native_width
+    l01 = rel_tl[0] / native_height
+    l11 = rel_tl[1] / native_height
+
+    nx0, ny0 = native_min[0], native_min[1]
+    tx = world_bl[0] - (l00 * nx0 + l01 * ny0)
+    ty = world_bl[1] - (l10 * nx0 + l11 * ny0)
+
+    return (
+        (l00, l01, 0.0, tx),
+        (l10, l11, 0.0, ty),
+        (0.0, 0.0, 1.0, 0.0),
+        (0.0, 0.0, 0.0, 1.0),
+    )
+
+
+def insert_raster_image(target_doc, bmp_path: str, bpw_path: str, logger: logging.Logger):
+    """
+    Вставляет BMP-изображение в Model Space целевого документа с точной
+    геопривязкой по данным .bpw:
+        1. Читает .bpw -> аффинные коэффициенты A,B,C,D,E,F.
+        2. Читает размер BMP в пикселях (из заголовка файла).
+        3. Вычисляет мировые координаты нужных углов изображения.
+        4. Вставляет растр через AddRaster (масштаб 1, поворот 0) во
+           временную точку — нижний левый угол цели.
+        5. Измеряет фактический ("естественный") размер вставленного
+           изображения через GetBoundingBox и строит аффинную матрицу,
+           переводящую его точно в целевой прямоугольник.
+        6. Применяет матрицу через TransformBy.
+    Возвращает (успех: bool, сообщение: str).
+    """
+    try:
+        A, D, B, E, C, F = parse_bpw(bpw_path)
+    except Exception as e:
+        return False, f"Не удалось прочитать .bpw: {e}"
+
+    try:
+        width_px, height_px = read_bmp_pixel_size(bmp_path)
+    except Exception as e:
+        return False, f"Не удалось прочитать размер BMP: {e}"
+
+    corners = compute_image_world_corners(A, D, B, E, C, F, width_px, height_px)
+    bl, br, tl = corners["BL"], corners["BR"], corners["TL"]
+
+    try:
+        model_space = com_retry(lambda: target_doc.ModelSpace, logger=logger)
+        insertion_variant = VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8,
+                                     (bl[0], bl[1], 0.0))
+        img = com_retry(model_space.AddRaster, bmp_path, insertion_variant,
+                         1.0, 0.0, logger=logger)
+        time.sleep(0.2)
+        pythoncom.PumpWaitingMessages()
+
+        native_min, native_max = com_retry(img.GetBoundingBox, logger=logger)
+        matrix = _build_affine_transform_matrix(native_min, native_max, bl, br, tl)
+        if matrix is None:
+            return False, ("изображение вставлено, но привязка не применена "
+                            "(нулевой размер после вставки)")
+
+        matrix_variant = VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, matrix)
+        com_retry(img.TransformBy, matrix_variant, logger=logger)
+        return True, ""
+    except Exception as e:
+        return False, f"Ошибка вставки растра: {e}"
 
 
 def create_target_document(acad, template: str, logger: logging.Logger):
@@ -339,7 +550,7 @@ def merge_file_into_target(acad, source_path: str, target_doc,
 def run_merge(dwg_files: list, output_path: str, template=None,
               paperspace=False, offset=(0.0, 0.0, 0.0), visible=True,
               logger=None, log_callback=None, progress_callback=None,
-              stop_flag=None):
+              stop_flag=None, image_pairs=None):
     """
     Основная функция слияния — не зависит от argparse/CLI, поэтому её же
     использует и GUI-приложение (merge_dwg_gui.py).
@@ -349,6 +560,10 @@ def run_merge(dwg_files: list, output_path: str, template=None,
                               отфильтрованный вызывающей стороной: GUI сам
                               решает, какие файлы включены и нет дублей)
         output_path         — путь к результирующему .dwg
+        image_pairs         — необязательный список (bmp_path, bpw_path) —
+                              растровые изображения с привязкой, которые
+                              нужно вставить в результирующий чертёж после
+                              объединения .dwg (см. find_bmp_bpw_pairs())
         log_callback(msg, level)  — необязательный колбэк для вывода строк
                               лога в GUI (level: "info"/"warning"/"error")
         progress_callback(done, total, filename) — необязательный колбэк
@@ -358,7 +573,8 @@ def run_merge(dwg_files: list, output_path: str, template=None,
                               пользователем из GUI между файлами
 
     Возвращает dict:
-        {"ok": int, "fail": int, "total_objects": int, "errors": [(path, msg), ...]}
+        {"ok": int, "fail": int, "total_objects": int, "errors": [(path, msg), ...],
+         "images_ok": int, "images_fail": int}
     """
     def log(msg, level="info"):
         if logger:
@@ -395,6 +611,34 @@ def run_merge(dwg_files: list, output_path: str, template=None,
         if progress_callback:
             progress_callback(i, total, os.path.basename(path))
 
+    # ------------------------------------------------------------------
+    # Растровые изображения (BMP + BPW) — вставляются последними, уже
+    # в готовый результирующий документ, каждое сразу в свою привязку.
+    # ------------------------------------------------------------------
+    image_pairs = image_pairs or []
+    images_ok = 0
+    images_fail = 0
+    total_images = len(image_pairs)
+
+    for i, (bmp_path, bpw_path) in enumerate(image_pairs, start=1):
+        if stop_flag is not None and stop_flag.is_set():
+            log(f"Остановлено пользователем перед изображением "
+                f"{os.path.basename(bmp_path)}", "warning")
+            break
+
+        success, msg = insert_raster_image(target_doc, bmp_path, bpw_path,
+                                            logger or _NullLogger())
+        if success:
+            images_ok += 1
+            log(f"OK   {os.path.basename(bmp_path)}  (вставлено по BPW-привязке)", "info")
+        else:
+            images_fail += 1
+            errors.append((bmp_path, msg))
+            log(f"FAIL {os.path.basename(bmp_path)}: {msg}", "error")
+
+        if progress_callback:
+            progress_callback(total + i, total + total_images, os.path.basename(bmp_path))
+
     try:
         output_path = os.path.abspath(output_path)
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -404,7 +648,8 @@ def run_merge(dwg_files: list, output_path: str, template=None,
         log(f"Ошибка сохранения результирующего файла: {e}", "error")
         raise
 
-    return {"ok": ok_count, "fail": fail_count, "total_objects": total_objects, "errors": errors}
+    return {"ok": ok_count, "fail": fail_count, "total_objects": total_objects,
+            "errors": errors, "images_ok": images_ok, "images_fail": images_fail}
 
 
 class _NullLogger:
@@ -441,6 +686,9 @@ def main():
                          help="Показывать окно AutoCAD во время работы (рекомендуется, включено по умолчанию)")
     parser.add_argument("--hidden", dest="visible", action="store_false",
                          help="Скрыть окно AutoCAD (может маскировать всплывающие диалоги — не рекомендуется)")
+    parser.add_argument("--no-images", dest="images", action="store_false", default=True,
+                         help="Не искать и не вставлять пары BMP+BPW из папки --source "
+                              "(по умолчанию они вставляются автоматически)")
     parser.add_argument("--log", default="merge_dwg_com.log", help="Путь к файлу лога")
     args = parser.parse_args()
 
@@ -456,7 +704,16 @@ def main():
         sys.exit(1)
     logger.info(f"Найдено файлов для объединения: {len(dwg_files)}")
 
-    pbar = tqdm(total=len(dwg_files), desc="Объединение", unit="файл")
+    image_pairs = []
+    if args.images:
+        image_pairs, missing_bpw = find_bmp_bpw_pairs_verbose(args.source)
+        if image_pairs:
+            logger.info(f"Найдено изображений BMP+BPW для вставки: {len(image_pairs)}")
+        for bmp_path in missing_bpw:
+            logger.warning(f"Пропущен {os.path.basename(bmp_path)}: не найден "
+                            f"соответствующий .bpw (нет привязки)")
+
+    pbar = tqdm(total=len(dwg_files) + len(image_pairs), desc="Объединение", unit="файл")
 
     def _progress(done, total, filename):
         pbar.n = done
@@ -467,7 +724,7 @@ def main():
         summary = run_merge(
             dwg_files, args.output, template=args.template,
             paperspace=args.paperspace, offset=args.offset, visible=args.visible,
-            logger=logger, progress_callback=_progress)
+            logger=logger, progress_callback=_progress, image_pairs=image_pairs)
     except Exception:
         pbar.close()
         sys.exit(1)
@@ -476,6 +733,9 @@ def main():
     logger.info("=" * 70)
     logger.info(f"ГОТОВО. Успешно: {summary['ok']}, ошибок: {summary['fail']}, "
                 f"всего скопировано объектов: {summary['total_objects']}")
+    if image_pairs:
+        logger.info(f"Изображений вставлено: {summary['images_ok']}, "
+                    f"с ошибкой: {summary['images_fail']}")
     if summary["errors"]:
         logger.info("Файлы, обработанные с ошибкой:")
         for path, msg in summary["errors"]:
