@@ -420,13 +420,8 @@ class MergeApp(tk.Tk):
             pairs = []
             missing = []
             for bmp_path in bmp_files:
-                stem, _ = os.path.splitext(bmp_path)
-                bpw_path = stem + ".bpw"
-                if not os.path.isfile(bpw_path):
-                    import glob as _glob
-                    candidates = _glob.glob(stem + ".[bB][pP][wW]")
-                    bpw_path = candidates[0] if candidates else None
-                if bpw_path and os.path.isfile(bpw_path):
+                bpw_path = core.find_bpw_for_bmp(bmp_path)
+                if bpw_path:
                     pairs.append((bmp_path, bpw_path))
                 else:
                     missing.append(bmp_path)
@@ -435,10 +430,11 @@ class MergeApp(tk.Tk):
             if img_added:
                 self._log(f"Перетащено изображений BMP+BPW: {img_added}", "info")
             if missing:
-                messagebox.showwarning(
-                    "Нет привязки",
-                    "Для следующих изображений не найден соседний .bpw файл — "
-                    "они не добавлены:\n\n"
+                messagebox.showinfo(
+                    "Привязка не найдена",
+                    "Для этих изображений рядом нет файла .bpw, поэтому "
+                    "они не были добавлены (без привязки AutoCAD не знает, "
+                    "куда их поместить):\n\n"
                     + "\n".join(os.path.basename(p) for p in missing))
 
         if ignored:
@@ -451,42 +447,45 @@ class MergeApp(tk.Tk):
     # ------------------------------------------------------------------
     # Работа со списком файлов
     # ------------------------------------------------------------------
-    def _existing_basenames(self) -> set:
-        return {os.path.basename(v["path"]).lower() for v in self.items.values()}
+    def _existing_paths(self) -> set:
+        # Сравниваем по полному нормализованному пути, а не только по имени
+        # файла: иначе, например, "участок1.dwg" из двух разных папок
+        # ошибочно считался бы дубликатом, хотя это разные чертежи.
+        return {os.path.normcase(os.path.abspath(v["path"])) for v in self.items.values()}
 
     def _add_paths(self, paths: list):
-        existing = self._existing_basenames()
+        existing = self._existing_paths()
         duplicates = []
         added = 0
         for path in paths:
-            base = os.path.basename(path).lower()
-            if base in existing:
-                duplicates.append(os.path.basename(path))
+            key = os.path.normcase(os.path.abspath(path))
+            if key in existing:
+                duplicates.append(path)
                 continue
             item_id = self.tree.insert(
                 "", "end",
                 values=("☑", os.path.basename(path), "DWG", path, "готов"),
                 tags=("pending",))
             self.items[item_id] = {"path": path, "included": True, "kind": "dwg"}
-            existing.add(base)
+            existing.add(key)
             added += 1
 
         if duplicates:
-            messagebox.showwarning(
-                "Дубликаты пропущены",
-                "Следующие файлы уже есть в списке (по имени) и не были добавлены повторно:\n\n"
+            messagebox.showinfo(
+                "Уже в списке",
+                "Эти файлы уже есть в списке и не были добавлены повторно:\n\n"
                 + "\n".join(duplicates)
             )
         return added
 
     def _add_image_pairs(self, pairs: list):
-        existing = self._existing_basenames()
+        existing = self._existing_paths()
         duplicates = []
         added = 0
         for bmp_path, bpw_path in pairs:
-            base = os.path.basename(bmp_path).lower()
-            if base in existing:
-                duplicates.append(os.path.basename(bmp_path))
+            key = os.path.normcase(os.path.abspath(bmp_path))
+            if key in existing:
+                duplicates.append(bmp_path)
                 continue
             item_id = self.tree.insert(
                 "", "end",
@@ -495,13 +494,13 @@ class MergeApp(tk.Tk):
                 tags=("pending",))
             self.items[item_id] = {"path": bmp_path, "bpw": bpw_path,
                                     "included": True, "kind": "image"}
-            existing.add(base)
+            existing.add(key)
             added += 1
 
         if duplicates:
-            messagebox.showwarning(
-                "Дубликаты пропущены",
-                "Следующие изображения уже есть в списке (по имени) и не были добавлены повторно:\n\n"
+            messagebox.showinfo(
+                "Уже в списке",
+                "Эти изображения уже есть в списке и не были добавлены повторно:\n\n"
                 + "\n".join(duplicates)
             )
         return added
@@ -550,13 +549,8 @@ class MergeApp(tk.Tk):
             pairs = []
             missing = []
             for bmp_path in bmp_paths:
-                stem, _ = os.path.splitext(bmp_path)
-                bpw_path = stem + ".bpw"
-                if not os.path.isfile(bpw_path):
-                    import glob as _glob
-                    candidates = _glob.glob(stem + ".[bB][pP][wW]")
-                    bpw_path = candidates[0] if candidates else None
-                if bpw_path and os.path.isfile(bpw_path):
+                bpw_path = core.find_bpw_for_bmp(bmp_path)
+                if bpw_path:
                     pairs.append((bmp_path, bpw_path))
                 else:
                     missing.append(bmp_path)
@@ -565,10 +559,11 @@ class MergeApp(tk.Tk):
             if img_added:
                 self._log(f"Добавлено изображений BMP+BPW вручную: {img_added}", "info")
             if missing:
-                messagebox.showwarning(
-                    "Нет привязки",
-                    "Для следующих изображений не найден соседний .bpw файл — "
-                    "они не добавлены:\n\n" + "\n".join(os.path.basename(p) for p in missing))
+                messagebox.showinfo(
+                    "Привязка не найдена",
+                    "Для этих изображений рядом нет файла .bpw, поэтому "
+                    "они не были добавлены (без привязки AutoCAD не знает, "
+                    "куда их поместить):\n\n" + "\n".join(os.path.basename(p) for p in missing))
 
     def _on_remove_selected(self):
         selected = self.tree.selection()
@@ -628,12 +623,23 @@ class MergeApp(tk.Tk):
         if not self.include_images_var.get():
             image_pairs = []
 
-        if not dwg_paths and not image_pairs:
-            messagebox.showerror("Нет файлов", "Список файлов для объединения пуст.")
-            return
         output_path = self.output_path.get().strip()
+
+        try:
+            check_warnings = core.validate_before_merge(
+                dwg_paths, output_path or "merged.dwg", image_pairs=image_pairs)
+        except core.MergeError as e:
+            messagebox.showwarning("Не готово к запуску", str(e))
+            return
+
         if not output_path:
-            messagebox.showerror("Не указан результат", "Укажите путь к результирующему .dwg файлу.")
+            messagebox.showwarning(
+                "Не указан результат", "Укажите, пожалуйста, путь к результирующему .dwg файлу.")
+            return
+
+        if check_warnings and not messagebox.askyesno(
+                "Стоит проверить перед запуском",
+                "\n\n".join(check_warnings) + "\n\nВсё равно продолжить?"):
             return
 
         self._save_current_settings()
@@ -662,14 +668,14 @@ class MergeApp(tk.Tk):
         def log_cb(msg, level):
             self.log_queue.put(("log", msg, level))
 
-        def progress_cb(done, total, filename):
+        def progress_cb(done, total, filename, success=True):
             self.log_queue.put(("progress", done, total, filename))
             all_paths = dwg_paths + [bmp for bmp, _bpw in image_pairs]
             for path in all_paths:
                 if os.path.basename(path) == filename:
                     item_id = path_to_item.get(path)
                     if item_id:
-                        self.log_queue.put(("status", item_id))
+                        self.log_queue.put(("status", item_id, success))
                     break
 
         try:
@@ -680,8 +686,11 @@ class MergeApp(tk.Tk):
                 log_callback=log_cb, progress_callback=progress_cb,
                 stop_flag=self.stop_flag, image_pairs=image_pairs)
             self.log_queue.put(("done", summary))
-        except Exception as e:
+        except core.MergeError as e:
+            # MergeError уже содержит понятный текст без COM-мусора
             self.log_queue.put(("fatal", str(e)))
+        except Exception as e:
+            self.log_queue.put(("fatal", core.describe_com_error(e)))
 
     # ------------------------------------------------------------------
     # Очереди UI
@@ -698,8 +707,8 @@ class MergeApp(tk.Tk):
                     _, done, total, filename = event
                     self.progress.config(maximum=total, value=done)
                 elif kind == "status":
-                    _, item_id = event
-                    self._mark_item_status(item_id)
+                    _, item_id, success = event
+                    self._mark_item_status(item_id, success)
                 elif kind == "done":
                     _, summary = event
                     self._on_merge_done(summary)
@@ -718,10 +727,15 @@ class MergeApp(tk.Tk):
 
         self.after(100, self._poll_log_queue)
 
-    def _mark_item_status(self, item_id):
+    def _mark_item_status(self, item_id, success=True):
         vals = list(self.tree.item(item_id, "values"))
-        vals[4] = "обработан"
-        self.tree.item(item_id, values=vals, tags=("ok",))
+        if success:
+            vals[4] = "обработан"
+            tag = "ok"
+        else:
+            vals[4] = "ошибка (см. журнал)"
+            tag = "fail"
+        self.tree.item(item_id, values=vals, tags=(tag,))
 
     def _set_all_status(self, text, tag):
         for item_id, info in self.items.items():
@@ -746,10 +760,10 @@ class MergeApp(tk.Tk):
             for path, msg in summary["errors"]:
                 self._log(f"  Ошибка в {os.path.basename(path)}: {msg}", "error")
             messagebox.showwarning(
-                "Завершено с ошибками",
-                f"DWG успешно: {summary['ok']} (ошибок: {summary['fail']}), "
-                f"изображений успешно: {images_ok} (ошибок: {images_fail}).\n"
-                f"Подробности — в журнале.")
+                "Готово, но не всё прошло гладко",
+                f"DWG успешно: {summary['ok']} (не удалось: {summary['fail']}), "
+                f"изображений успешно: {images_ok} (не удалось: {images_fail}).\n"
+                f"Подробности по каждому файлу — в журнале ниже.")
         else:
             messagebox.showinfo(
                 "Готово",
@@ -759,8 +773,11 @@ class MergeApp(tk.Tk):
     def _on_merge_fatal(self, msg):
         self.run_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
-        self._log(f"КРИТИЧЕСКАЯ ОШИБКА: {msg}", "error")
-        messagebox.showerror("Ошибка", f"Не удалось выполнить объединение:\n{msg}")
+        self._log(f"Не удалось выполнить объединение: {msg}", "error")
+        messagebox.showerror(
+            "Не удалось выполнить объединение",
+            f"{msg}\n\nУже обработанные файлы затронуты не были — "
+            "можно поправить проблему и запустить снова.")
 
     def _log(self, msg: str, level: str = "info"):
         self.log_text.config(state="normal")

@@ -62,6 +62,7 @@ import glob
 import logging
 import os
 import struct
+import subprocess
 import sys
 import time
 
@@ -95,6 +96,58 @@ RETRYABLE_HRESULTS = {
 }
 
 
+class MergeError(Exception):
+    """
+    Ошибка, понятная пользователю "как есть" (без кодов HRESULT, COM-мусора
+    и трассировок Python). Текст такого исключения можно без стыда показать
+    в диалоговом окне GUI или напечатать в консоли.
+    """
+    pass
+
+
+def describe_com_error(e) -> str:
+    """
+    Превращает pywintypes.com_error (или любое другое исключение) в короткое
+    понятное сообщение на русском, без кода HRESULT и технических деталей
+    Windows/COM. Если распознать ошибку не удалось — возвращает исходный
+    текст исключения как есть (тоже без "мусора" вроде адресов памяти).
+    """
+    if isinstance(e, pywintypes.com_error):
+        hresult = e.args[0] if e.args else None
+
+        # excepinfo (если есть) обычно содержит человекочитаемое сообщение,
+        # которое сформировал сам AutoCAD/Windows — оно почти всегда лучше,
+        # чем то, что можем придумать мы сами.
+        raw_text = ""
+        excepinfo = e.args[2] if len(e.args) > 2 else None
+        if excepinfo and len(excepinfo) > 2 and excepinfo[2]:
+            raw_text = str(excepinfo[2]).strip()
+        elif len(e.args) > 1 and e.args[1]:
+            raw_text = str(e.args[1]).strip()
+
+        known = {
+            -2147221231: ("AutoCAD не установлен или не зарегистрирован в системе. "
+                           "Убедитесь, что AutoCAD установлен на этом компьютере и "
+                           "хотя бы раз был запущен вручную."),
+            -2147418111: ("AutoCAD долго не отвечал на команды — вероятно, он был "
+                           "занят или ждал вашего ответа в открытом диалоговом окне."),
+            -2147417846: ("AutoCAD долго не отвечал на команды (был занят другой "
+                           "операцией)."),
+            -2147023174: ("AutoCAD временно недоступен по COM. Обычно помогает "
+                           "повторный запуск программы."),
+            -2145320928: ("Файл повреждён или не является корректным чертежом "
+                           "AutoCAD."),
+        }
+        if hresult in known:
+            return known[hresult]
+        if raw_text:
+            return raw_text
+        return "AutoCAD сообщил о внутренней ошибке во время выполнения операции."
+
+    msg = str(e).strip()
+    return msg if msg else e.__class__.__name__
+
+
 # --------------------------------------------------------------------------
 # Надёжный вызов COM-методов/свойств AutoCAD с автоповтором
 # --------------------------------------------------------------------------
@@ -121,8 +174,37 @@ def com_retry(func, *args, retries=40, delay=0.5, logger=None, **kwargs):
                 continue
             raise  # ошибка не из "временных" — пробрасываем сразу
     if logger:
-        logger.warning(f"com_retry: превышено число попыток ({retries})")
+        logger.warning(
+            f"AutoCAD не ответил за отведённое время ({retries} попыток) — "
+            "возможно, он завис или ждёт закрытия диалогового окна."
+        )
     raise last_exc
+
+
+def _set_visible_with_retry(acad, visible: bool, logger, retries=60, delay=0.5):
+    """
+    Устанавливает Application.Visible с повтором ЛЮБЫХ COM-ошибок (не только
+    "стандартных" из RETRYABLE_HRESULTS). Это первое обращение к только что
+    запущенному AutoCAD, и сразу после старта (особенно если процесс подняли
+    вручную через subprocess, а не через штатный Dispatch) он может ещё
+    какое-то время не принимать даже базовые обращения к своим свойствам —
+    AutoCAD в этот момент отвечает не "занят" (RPC_E_CALL_REJECTED), а
+    произвольной ошибкой вида "Property ... can not be set", которую обычный
+    com_retry не считает поводом для повтора.
+    """
+    last_exc = None
+    for _ in range(retries):
+        try:
+            acad.Visible = visible
+            return
+        except pywintypes.com_error as e:
+            last_exc = e
+            pythoncom.PumpWaitingMessages()
+            time.sleep(delay)
+    friendly = describe_com_error(last_exc)
+    raise MergeError(
+        f"AutoCAD запустился, но долго не был готов принимать команды: {friendly}"
+    ) from last_exc
 
 
 # --------------------------------------------------------------------------
@@ -149,16 +231,74 @@ def setup_logging(log_path: str) -> logging.Logger:
 # --------------------------------------------------------------------------
 # Работа с AutoCAD через COM
 # --------------------------------------------------------------------------
+def _find_acad_exe():
+    """
+    Ищет acad.exe в стандартных папках установки Autodesk (когда COM-класс
+    не зарегистрирован, но сам AutoCAD на диске есть). Возвращает путь к
+    самой новой найденной версии или None, если ничего не нашлось.
+    """
+    roots = [
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+    ]
+    candidates = []
+    for root in roots:
+        pattern = os.path.join(root, "Autodesk", "AutoCAD*", "acad.exe")
+        candidates.extend(glob.glob(pattern))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)  # свежие версии обычно идут позже по алфавиту
+    return candidates[0]
+
+
 def get_or_start_acad(visible: bool, logger: logging.Logger):
     """Запускает новый экземпляр AutoCAD (или подключается к запущенному)."""
     pythoncom.CoInitialize()
     try:
         acad = win32com.client.Dispatch("AutoCAD.Application")
     except Exception as e:
-        logger.error(f"Не удалось запустить/подключиться к AutoCAD через COM: {e}")
-        raise
+        # Частый случай: COM-класс не зарегистрирован (например, AutoCAD
+        # ни разу не запускали вручную под этим пользователем Windows).
+        # Пробуем найти acad.exe на диске и запустить его напрямую — после
+        # этого регистрация обычно "подхватывается" и COM начинает работать.
+        exe_path = _find_acad_exe()
+        if not exe_path:
+            friendly = describe_com_error(e)
+            logger.error(f"Не удалось запустить AutoCAD: {friendly}")
+            raise MergeError(f"Не удалось запустить AutoCAD: {friendly}") from e
 
-    acad.Visible = visible
+        logger.warning(
+            f"Не удалось подключиться к AutoCAD через COM напрямую — "
+            f"пробую запустить его вручную: {exe_path}"
+        )
+        try:
+            subprocess.Popen([exe_path])
+        except Exception as launch_err:
+            friendly = describe_com_error(e)
+            raise MergeError(
+                f"Не удалось запустить AutoCAD: {friendly} "
+                f"(попытка запустить {exe_path} напрямую тоже не удалась: {launch_err})"
+            ) from e
+
+        # Ждём, пока AutoCAD поднимется и зарегистрирует себя в COM.
+        acad = None
+        last_err = e
+        for _ in range(30):  # до ~60 секунд
+            time.sleep(2)
+            try:
+                acad = win32com.client.Dispatch("AutoCAD.Application")
+                break
+            except Exception as retry_err:
+                last_err = retry_err
+                continue
+        if acad is None:
+            friendly = describe_com_error(last_err)
+            raise MergeError(
+                f"AutoCAD запустился, но не удалось подключиться к нему по COM "
+                f"за отведённое время: {friendly}"
+            ) from last_err
+
+    _set_visible_with_retry(acad, visible, logger)
 
     # Даём AutoCAD полноценно инициализироваться, прежде чем слать команды.
     # Это дольше, чем может показаться нужным, но именно нехватка этой паузы
@@ -175,6 +315,95 @@ def get_or_start_acad(visible: bool, logger: logging.Logger):
 def find_dwg_files(source_folder: str) -> list:
     pattern = os.path.join(source_folder, "**", "*.dwg")
     return sorted(glob.glob(pattern, recursive=True))
+
+
+# --------------------------------------------------------------------------
+# Предварительные проверки перед запуском (до старта AutoCAD)
+# --------------------------------------------------------------------------
+def validate_before_merge(dwg_files, output_path, template=None, image_pairs=None) -> list:
+    """
+    Проверяет входные данные ДО того, как будет запущен AutoCAD — так
+    большинство проблем (опечатка в пути, файл удалён, нет прав на запись)
+    обнаруживаются сразу и без траты времени на запуск тяжёлого COM-сервера.
+
+    Бросает MergeError с понятным описанием, если найдена проблема, при
+    которой запуск не имеет смысла (например, пустой список файлов).
+
+    Возвращает список некритичных предупреждений (str) — их стоит показать
+    пользователю, но они не мешают продолжить работу.
+    """
+    warnings = []
+    dwg_files = list(dwg_files or [])
+    image_pairs = list(image_pairs or [])
+
+    if not dwg_files and not image_pairs:
+        raise MergeError("Список файлов для объединения пуст — добавьте хотя бы один файл.")
+
+    missing = [p for p in dwg_files if not os.path.isfile(p)]
+    if missing:
+        shown = "\n".join(f"  • {p}" for p in missing[:10])
+        more = f"\n  …и ещё {len(missing) - 10}" if len(missing) > 10 else ""
+        raise MergeError(
+            "Не удалось найти на диске следующие файлы (возможно, папка "
+            "или сетевой диск сейчас недоступны, либо файлы были "
+            f"перемещены/удалены):\n{shown}{more}"
+        )
+
+    empty = [p for p in dwg_files if os.path.getsize(p) == 0]
+    if empty:
+        warnings.append(
+            "Эти файлы имеют нулевой размер и, вероятнее всего, будут "
+            "пропущены при объединении: " + ", ".join(os.path.basename(p) for p in empty[:10])
+        )
+
+    missing_bmp = [bmp for bmp, bpw in image_pairs if not os.path.isfile(bmp)]
+    missing_bpw = [bpw for bmp, bpw in image_pairs if not os.path.isfile(bpw)]
+    if missing_bmp or missing_bpw:
+        warnings.append(
+            "Часть изображений или файлов привязки (.bpw) не найдена на "
+            "диске и будет пропущена при вставке."
+        )
+
+    if template and not os.path.isfile(template):
+        raise MergeError(f"Указанный шаблон не найден: {template}")
+
+    output_path_abs = os.path.abspath(output_path)
+    if not output_path_abs.lower().endswith(".dwg"):
+        warnings.append(
+            "Путь к результату не заканчивается на «.dwg» — файл всё равно "
+            "будет сохранён в формате чертежа AutoCAD, просто под указанным "
+            "вами именем."
+        )
+
+    out_dir = os.path.dirname(output_path_abs) or "."
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception as e:
+        raise MergeError(
+            f"Не удалось создать или открыть папку для результата "
+            f"«{out_dir}»: {describe_com_error(e)}"
+        )
+    if not os.access(out_dir, os.W_OK):
+        raise MergeError(f"Нет прав на запись в папку результата: {out_dir}")
+
+    src_normalized = {os.path.normcase(os.path.abspath(p)) for p in dwg_files}
+    if os.path.normcase(output_path_abs) in src_normalized:
+        raise MergeError(
+            "Путь к результату совпадает с одним из исходных файлов. Если "
+            "продолжить, исходник будет перезаписан результатом объединения "
+            "— укажите, пожалуйста, другой путь для сохранения."
+        )
+
+    if os.path.isfile(output_path_abs):
+        warnings.append(f"Файл «{output_path_abs}» уже существует и будет перезаписан.")
+
+    if len(dwg_files) > 500:
+        warnings.append(
+            f"Файлов для объединения довольно много ({len(dwg_files)}) — "
+            "процесс может занять продолжительное время."
+        )
+
+    return warnings
 
 
 # --------------------------------------------------------------------------
@@ -196,17 +425,28 @@ def find_bmp_bpw_pairs_verbose(source_folder: str):
     pairs = []
     missing = []
     for bmp_path in bmp_files:
-        stem, _ = os.path.splitext(bmp_path)
-        bpw_path = stem + ".bpw"
-        if not os.path.isfile(bpw_path):
-            # На случай другого регистра расширения (BPW/Bpw и т.п.)
-            candidates = glob.glob(stem + ".[bB][pP][wW]")
-            bpw_path = candidates[0] if candidates else None
-        if bpw_path and os.path.isfile(bpw_path):
+        bpw_path = find_bpw_for_bmp(bmp_path)
+        if bpw_path:
             pairs.append((bmp_path, bpw_path))
         else:
             missing.append(bmp_path)
     return pairs, missing
+
+
+def find_bpw_for_bmp(bmp_path: str):
+    """
+    Ищет файл привязки (.bpw) для конкретного .bmp — тот же файл, что и
+    картинка, но с расширением .bpw (регистр расширения не важен).
+    Возвращает путь к .bpw или None, если привязка не найдена. Используется
+    и при обходе папки, и при добавлении отдельных файлов вручную (GUI),
+    чтобы логика поиска не расходилась в двух местах.
+    """
+    stem, _ = os.path.splitext(bmp_path)
+    bpw_path = stem + ".bpw"
+    if os.path.isfile(bpw_path):
+        return bpw_path
+    candidates = glob.glob(stem + ".[bB][pP][wW]")
+    return candidates[0] if candidates else None
 
 
 def find_bmp_bpw_pairs(source_folder: str) -> list:
@@ -242,6 +482,11 @@ def parse_bpw(bpw_path: str):
         raise ValueError(
             f"Файл '{bpw_path}' содержит {len(values)} значений вместо 6")
     A, D, B, E, C, F = values[:6]
+    if abs(A) < 1e-12 and abs(E) < 1e-12:
+        raise ValueError(
+            f"Файл '{bpw_path}' задаёт нулевой масштаб изображения по X и Y "
+            "— похоже, файл привязки повреждён или пуст"
+        )
     return A, D, B, E, C, F
 
 
@@ -372,7 +617,7 @@ def insert_raster_image(target_doc, bmp_path: str, bpw_path: str, logger: loggin
         com_retry(img.TransformBy, matrix_variant, logger=logger)
         return True, ""
     except Exception as e:
-        return False, f"Ошибка вставки растра: {e}"
+        return False, f"Не удалось вставить изображение: {describe_com_error(e)}"
 
 
 def create_target_document(acad, template: str, logger: logging.Logger):
@@ -389,8 +634,9 @@ def create_target_document(acad, template: str, logger: logging.Logger):
         pythoncom.PumpWaitingMessages()
         return doc
     except Exception as e:
-        logger.error(f"Ошибка создания целевого документа: {e}")
-        raise
+        friendly = describe_com_error(e)
+        logger.error(f"Не удалось создать целевой документ: {friendly}")
+        raise MergeError(f"Не удалось создать целевой документ: {friendly}") from e
 
 
 def collect_modelspace_objects(doc, logger: logging.Logger) -> list:
@@ -499,7 +745,13 @@ def merge_file_into_target(acad, source_path: str, target_doc,
         time.sleep(0.5)
         pythoncom.PumpWaitingMessages()
     except Exception as e:
-        return False, 0, f"Не удалось открыть файл: {e}"
+        friendly = describe_com_error(e)
+        # Частый практический случай — файл уже открыт в другом AutoCAD/
+        # другим человеком: pywin32 обычно об этом сообщает прямым текстом,
+        # но на всякий случай добавляем подсказку.
+        if "открыт" not in friendly.lower() and "in use" not in friendly.lower():
+            friendly += " (возможно, файл уже открыт в другой программе или повреждён)"
+        return False, 0, f"Не удалось открыть файл: {friendly}"
 
     total_copied = 0
     file_stem = os.path.splitext(os.path.basename(source_path))[0]
@@ -533,7 +785,7 @@ def merge_file_into_target(acad, source_path: str, target_doc,
 
         return True, total_copied, ""
     except Exception as e:
-        return False, total_copied, f"Ошибка копирования объектов: {e}"
+        return False, total_copied, f"Не удалось скопировать объекты: {describe_com_error(e)}"
     finally:
         try:
             if src_doc is not None:
@@ -541,7 +793,13 @@ def merge_file_into_target(acad, source_path: str, target_doc,
                 time.sleep(0.3)
                 pythoncom.PumpWaitingMessages()
         except Exception as e:
-            logger.warning(f"Не удалось закрыть исходный документ {source_path}: {e}")
+            # Не критично для общего результата — файл всё равно уже обработан,
+            # поэтому пишем в лог как предупреждение, а не как сбой всего процесса.
+            logger.warning(
+                f"Не удалось автоматически закрыть исходный документ "
+                f"{os.path.basename(source_path)}: {describe_com_error(e)}. "
+                "Это не помешало объединению, но окно могло остаться открытым в AutoCAD."
+            )
 
 
 # --------------------------------------------------------------------------
@@ -566,8 +824,10 @@ def run_merge(dwg_files: list, output_path: str, template=None,
                               объединения .dwg (см. find_bmp_bpw_pairs())
         log_callback(msg, level)  — необязательный колбэк для вывода строк
                               лога в GUI (level: "info"/"warning"/"error")
-        progress_callback(done, total, filename) — необязательный колбэк
-                              для обновления прогресс-бара в GUI
+        progress_callback(done, total, filename, success) — необязательный
+                              колбэк для обновления прогресс-бара в GUI;
+                              success == True/False сообщает, успешно ли
+                              обработан именно этот файл
         stop_flag            — необязательный объект с атрибутом .is_set()
                               (например, threading.Event) для отмены процесса
                               пользователем из GUI между файлами
@@ -581,6 +841,11 @@ def run_merge(dwg_files: list, output_path: str, template=None,
             getattr(logger, level, logger.info)(msg)
         if log_callback:
             log_callback(msg, level)
+
+    # Страховочная проверка — даже если вызывающая сторона (CLI/GUI) уже
+    # проверила входные данные, лучше не запускать тяжёлый AutoCAD зря.
+    for w in validate_before_merge(dwg_files, output_path, template, image_pairs):
+        log(w, "warning")
 
     acad = get_or_start_acad(visible, logger or _NullLogger())
     target_doc = create_target_document(acad, template, logger or _NullLogger())
@@ -609,7 +874,7 @@ def run_merge(dwg_files: list, output_path: str, template=None,
             log(f"FAIL {os.path.basename(path)}: {msg}", "error")
 
         if progress_callback:
-            progress_callback(i, total, os.path.basename(path))
+            progress_callback(i, total, os.path.basename(path), success)
 
     # ------------------------------------------------------------------
     # Растровые изображения (BMP + BPW) — вставляются последними, уже
@@ -637,7 +902,7 @@ def run_merge(dwg_files: list, output_path: str, template=None,
             log(f"FAIL {os.path.basename(bmp_path)}: {msg}", "error")
 
         if progress_callback:
-            progress_callback(total + i, total + total_images, os.path.basename(bmp_path))
+            progress_callback(total + i, total + total_images, os.path.basename(bmp_path), success)
 
     try:
         output_path = os.path.abspath(output_path)
@@ -645,8 +910,9 @@ def run_merge(dwg_files: list, output_path: str, template=None,
         com_retry(target_doc.SaveAs, output_path, logger=logger)
         log(f"Результирующий файл сохранён: {output_path}", "info")
     except Exception as e:
-        log(f"Ошибка сохранения результирующего файла: {e}", "error")
-        raise
+        friendly = describe_com_error(e)
+        log(f"Не удалось сохранить результирующий файл: {friendly}", "error")
+        raise MergeError(f"Не удалось сохранить результирующий файл: {friendly}") from e
 
     return {"ok": ok_count, "fail": fail_count, "total_objects": total_objects,
             "errors": errors, "images_ok": images_ok, "images_fail": images_fail}
@@ -700,7 +966,7 @@ def main():
 
     dwg_files = find_dwg_files(args.source)
     if not dwg_files:
-        logger.error("В указанной папке не найдено ни одного .dwg файла")
+        logger.error("В указанной папке не найдено ни одного .dwg файла — проверьте путь и наличие файлов")
         sys.exit(1)
     logger.info(f"Найдено файлов для объединения: {len(dwg_files)}")
 
@@ -713,9 +979,19 @@ def main():
             logger.warning(f"Пропущен {os.path.basename(bmp_path)}: не найден "
                             f"соответствующий .bpw (нет привязки)")
 
+    # Проверяем всё, что можно проверить, ДО запуска AutoCAD — так опечатка
+    # в пути или нехватка прав на запись обнаружится за секунды, а не после
+    # нескольких минут работы.
+    try:
+        for w in validate_before_merge(dwg_files, args.output, args.template, image_pairs):
+            logger.warning(w)
+    except MergeError as e:
+        logger.error(str(e))
+        sys.exit(1)
+
     pbar = tqdm(total=len(dwg_files) + len(image_pairs), desc="Объединение", unit="файл")
 
-    def _progress(done, total, filename):
+    def _progress(done, total, filename, success=True):
         pbar.n = done
         pbar.set_postfix_str(filename)
         pbar.refresh()
@@ -725,8 +1001,13 @@ def main():
             dwg_files, args.output, template=args.template,
             paperspace=args.paperspace, offset=args.offset, visible=args.visible,
             logger=logger, progress_callback=_progress, image_pairs=image_pairs)
-    except Exception:
+    except MergeError as e:
         pbar.close()
+        logger.error(str(e))
+        sys.exit(1)
+    except Exception as e:
+        pbar.close()
+        logger.error(f"Не удалось выполнить объединение: {describe_com_error(e)}")
         sys.exit(1)
     pbar.close()
 
