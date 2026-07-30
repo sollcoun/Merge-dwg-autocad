@@ -138,6 +138,14 @@ class MergeApp(tk.Tk):
 
         self._toggle_log_visibility()
         self.bind("<Button-1>", self._on_root_click, add="+")
+        self.bind("<Configure>", self._on_configure)
+
+    def _on_configure(self, event):
+        """Закрываем настройки при изменении размера/положения главного окна"""
+        if event.widget != self:
+            return
+        if self.dropdown and self.dropdown.winfo_exists():
+            self._close_dropdown()
 
     def _setup_styles(self):
         style = ttk.Style(self)
@@ -158,11 +166,19 @@ class MergeApp(tk.Tk):
         style.configure("Muted.TLabel", background=c["bg"], foreground=c["text_muted"], font=font_sm)
         style.configure("Title.TLabel", background=c["bg"], foreground=c["text"], font=("Segoe UI", 16, "bold"))
         style.configure("Sub.TLabel", background=c["bg"], foreground=c["text_dim"], font=font_sm)
+        style.configure("AccentSmall.TButton",
+                background=c["accent"], foreground="#ffffff",
+                bordercolor=c["accent"], lightcolor=c["accent"],
+                darkcolor=c["accent"], font=("Segoe UI", 10, "bold"),
+                padding=(16, 8))
+        style.map("AccentSmall.TButton",
+                background=[("active", c["accent_hover"]), ("disabled", "#555555")],
+                foreground=[("disabled", "#999999")])
 
         style.configure("TButton",
                         background=c["bg_input"], foreground=c["text"],
                         bordercolor=c["border"], lightcolor=c["bg_input"],
-                        darkcolor=c["bg_input"], font=font, padding=(14, 8))
+                        darkcolor=c["bg_input"], font=font, padding=(16, 9))
         style.map("TButton",
                   background=[("active", c["bg_hover"]), ("disabled", c["bg_card"])],
                   foreground=[("disabled", c["text_muted"])])
@@ -177,14 +193,14 @@ class MergeApp(tk.Tk):
 
         style.configure("Ghost.TButton",
                         background=c["bg"], foreground=c["text_dim"],
-                        bordercolor=c["border"], font=font, padding=(12, 7))
+                        bordercolor=c["border"], font=font, padding=(14, 8))
         style.map("Ghost.TButton",
                   background=[("active", c["bg_hover"])],
                   foreground=[("active", c["text"])])
 
         style.configure("Danger.TButton",
                         background="#2a1f1f", foreground=c["error"],
-                        bordercolor="#4a2a2a", font=font, padding=(12, 7))
+                        bordercolor="#4a2a2a", font=font, padding=(14, 8))
         style.map("Danger.TButton",
                   background=[("active", "#3a2a2a")])
 
@@ -269,29 +285,29 @@ class MergeApp(tk.Tk):
         bottom = ttk.Frame(self)
         bottom.pack(side="bottom", fill="x")
 
-        # Progress
-        self.progress = ttk.Progressbar(bottom, mode="determinate")
-        self.progress.pack(fill="x", padx=24, pady=(6, 2))
-
-        # Run bar
-        run_bar = ttk.Frame(bottom, padding=(24, 6, 24, 4))
+        # Одна линия: кнопки + прогресс-бар
+        run_bar = ttk.Frame(bottom, padding=(24, 10, 24, 6))
         run_bar.pack(fill="x")
 
-        self.run_btn = ttk.Button(run_bar, text="  ▷  Объединить", style="White.TButton",
+        self.run_btn = ttk.Button(run_bar, text="  ▷  Объединить", style="AccentSmall.TButton",
                                 command=self._on_run)
         self.run_btn.pack(side="left")
         Tooltip(self.run_btn, "Запустить объединение")
 
         self.stop_btn = ttk.Button(run_bar, text="  Стоп", style="Danger.TButton",
                                 command=self._on_stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=(10, 0))
+        self.stop_btn.pack(side="left", padx=(8, 0))
 
         self.open_folder_btn = ttk.Button(run_bar, text="  📂  Открыть папку",
                                         command=self._on_open_output_folder,
                                         state="disabled", style="Ghost.TButton")
-        self.open_folder_btn.pack(side="left", padx=(10, 0))
+        self.open_folder_btn.pack(side="left", padx=(8, 0))
 
-        # Log
+        # Прогресс-бар справа на той же линии
+        self.progress = ttk.Progressbar(run_bar, mode="determinate")
+        self.progress.pack(side="left", fill="x", expand=True, padx=(16, 0), ipady=1)
+
+        # Log под ними
         self.log_card = ttk.Frame(bottom, style="Card.TFrame", padding=(12, 8))
         self.log_card.pack(fill="x", padx=24, pady=(2, 12))
 
@@ -374,17 +390,18 @@ class MergeApp(tk.Tk):
         card = tk.Frame(outer, bg=COLORS["bg_card"], padx=22, pady=18)
         card.pack(fill="both", expand=True)
 
+        # Заголовок
         tk.Label(card, text="Настройки объединения",
-                 bg=COLORS["bg_card"], fg=COLORS["text"],
-                 font=("Segoe UI", 13, "bold")).pack(anchor="w")
+                bg=COLORS["bg_card"], fg=COLORS["text"],
+                font=("Segoe UI", 13, "bold")).pack(anchor="w")
         tk.Label(card, text="Куда сохранить и что показывать в процессе",
-                 bg=COLORS["bg_card"], fg=COLORS["text_muted"],
-                 font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 14))
+                bg=COLORS["bg_card"], fg=COLORS["text_muted"],
+                font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 14))
 
         # Путь
         tk.Label(card, text="КУДА СОХРАНЯТЬ РЕЗУЛЬТАТ",
-                 bg=COLORS["bg_card"], fg=COLORS["text_muted"],
-                 font=("Segoe UI", 8)).pack(anchor="w", pady=(0, 5))
+                bg=COLORS["bg_card"], fg=COLORS["text_muted"],
+                font=("Segoe UI", 8)).pack(anchor="w", pady=(0, 5))
 
         path_row = tk.Frame(card, bg=COLORS["bg_card"])
         path_row.pack(fill="x", pady=(0, 2))
@@ -393,16 +410,16 @@ class MergeApp(tk.Tk):
         entry.pack(side="left", fill="x", expand=True, ipady=3)
 
         ttk.Button(path_row, text="  Обзор", command=self._on_browse_output,
-                   style="Ghost.TButton").pack(side="left", padx=(8, 0))
+                style="Ghost.TButton").pack(side="left", padx=(8, 0))
 
         tk.Label(card, text="ⓘ  Если поле пустое — результат сохранится на рабочий стол",
-                 bg=COLORS["bg_card"], fg=COLORS["text_muted"],
-                 font=("Segoe UI", 8)).pack(anchor="w", pady=(4, 14))
+                bg=COLORS["bg_card"], fg=COLORS["text_muted"],
+                font=("Segoe UI", 8)).pack(anchor="w", pady=(4, 14))
 
         # Параметры
         tk.Label(card, text="ПАРАМЕТРЫ",
-                 bg=COLORS["bg_card"], fg=COLORS["text_muted"],
-                 font=("Segoe UI", 8)).pack(anchor="w", pady=(0, 8))
+                bg=COLORS["bg_card"], fg=COLORS["text_muted"],
+                font=("Segoe UI", 8)).pack(anchor="w", pady=(0, 8))
 
         def make_check(parent, var, title, desc, command=None):
             row = tk.Frame(parent, bg=COLORS["bg_card"])
@@ -430,48 +447,64 @@ class MergeApp(tk.Tk):
             text_frame.pack(side="left", fill="x")
 
             title_lbl = tk.Label(text_frame, text=title, bg=COLORS["bg_card"],
-                                 fg=COLORS["text"], font=("Segoe UI", 10), cursor="hand2")
+                                fg=COLORS["text"], font=("Segoe UI", 10), cursor="hand2")
             title_lbl.pack(anchor="w")
             title_lbl.bind("<Button-1>", lambda e: toggle())
 
             tk.Label(text_frame, text=desc, bg=COLORS["bg_card"],
-                     fg=COLORS["text_muted"], font=("Segoe UI", 8)).pack(anchor="w")
+                    fg=COLORS["text_muted"], font=("Segoe UI", 8)).pack(anchor="w")
 
             update_mark()
 
         make_check(card, self.paperspace_var,
-                   "Листы (Paper Space)",
-                   "Включить компоновки листов в итоговый файл")
+                "Листы (Paper Space)",
+                "Включить компоновки листов в итоговый файл")
 
         make_check(card, self.visible_var,
-                   "Показывать окно AutoCAD",
-                   "Видно, что программа делает в реальном времени")
+                "Показывать окно AutoCAD",
+                "Видно, что программа делает в реальном времени")
 
         make_check(card, self.include_images_var,
-                   "Вставлять картинки (BMP+BPW)",
-                   "Переносить растровые вставки из исходных чертежей")
+                "Вставлять картинки (BMP+BPW)",
+                "Переносить растровые вставки из исходных чертежей")
 
         make_check(card, self.show_log_var,
-                   "Показывать журнал «Что происходит»",
-                   "Подробный лог для диагностики ошибок",
-                   command=self._toggle_log_visibility)
+                "Показывать журнал «Что происходит»",
+                "Подробный лог для диагностики ошибок",
+                command=self._toggle_log_visibility)
 
         # Кнопки
         btn_row = tk.Frame(card, bg=COLORS["bg_card"])
         btn_row.pack(fill="x", pady=(14, 0))
 
         ttk.Button(btn_row, text="Отмена", style="Ghost.TButton",
-                   command=self._close_dropdown).pack(side="left")
+                command=self._close_dropdown).pack(side="left")
         ttk.Button(btn_row, text="Готово", style="White.TButton",
-                   command=self._close_dropdown).pack(side="right")
+                command=self._close_dropdown).pack(side="right")
 
+    # ========== ПОЗИЦИОНИРОВАНИЕ ==========
         self.update_idletasks()
-        bx = self.settings_btn.winfo_rootx() - 200
-        by = self.settings_btn.winfo_rooty() + self.settings_btn.winfo_height() + 6
-        drop.geometry(f"+{bx}+{by}")
+        drop.update_idletasks()
 
+        drop_width = 360
+        drop_height = card.winfo_reqheight() + 6
+
+        # Точные координаты кнопки
+        btn_x = self.settings_btn.winfo_rootx()
+        btn_y = self.settings_btn.winfo_rooty()
+        btn_w = self.settings_btn.winfo_width()
+        btn_h = self.settings_btn.winfo_height()
+
+        # Правый край выпадающего окна = правый край кнопки
+        bx = btn_x + btn_w - drop_width
+        by = btn_y + btn_h + 6
+
+        # Небольшое ограничение, чтобы не уезжало слишком далеко влево
+        if bx < btn_x - 300:
+            bx = btn_x - 20
+
+        drop.geometry(f"{drop_width}x{drop_height}+{bx}+{by}")
         self.dropdown = drop
-        drop.bind("<Button-1>", lambda e: "break")
 
     def _close_dropdown(self):
         if self.dropdown and self.dropdown.winfo_exists():
@@ -695,19 +728,42 @@ class MergeApp(tk.Tk):
         self._refresh_empty_state()
 
     def _on_tree_click(self, event):
-        if self.tree.identify_region(event.x, event.y) != "cell":
+        region = self.tree.identify_region(event.x, event.y)
+        if region != "cell":
             return
+
         col = self.tree.identify_column(event.x)
         item_id = self.tree.identify_row(event.y)
+
         if not item_id or item_id not in self.items:
             return
-        if col == "#1":
-            info = self.items[item_id]
-            info["included"] = not info["included"]
-            vals = list(self.tree.item(item_id, "values"))
-            vals[0] = "✓" if info["included"] else "☐"
-            self.tree.item(item_id, values=vals,
-                           tags=("pending",) if info["included"] else ("excluded",))
+
+        # Работаем только с колонкой галочки
+        if col != "#1":
+            return
+
+        # Новое состояние берём от того файла, по которому кликнули
+        info = self.items[item_id]
+        new_state = not info["included"]
+
+        # Какие строки нужно обновить:
+        # если кликнули по уже выделенной строке — меняем все выделенные
+        # если кликнули по невыделенной — меняем только её
+        selected = self.tree.selection()
+        if item_id in selected and len(selected) > 1:
+            items_to_update = [i for i in selected if i in self.items]
+        else:
+            items_to_update = [item_id]
+
+        for iid in items_to_update:
+            self.items[iid]["included"] = new_state
+            vals = list(self.tree.item(iid, "values"))
+            vals[0] = "✓" if new_state else "☐"
+            self.tree.item(iid, values=vals,
+                        tags=("pending",) if new_state else ("excluded",))
+
+        # Не даём Treeview менять selection при клике на галочку
+        return "break"
 
     # ------------------------------------------------------------------
     # Сохранение / запуск

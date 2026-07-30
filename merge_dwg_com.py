@@ -913,10 +913,22 @@ def run_merge(dwg_files: list, output_path: str, template=None,
         friendly = describe_com_error(e)
         log(f"Не удалось сохранить результирующий файл: {friendly}", "error")
         raise MergeError(f"Не удалось сохранить результирующий файл: {friendly}") from e
+    # Автоматический Zoom Extents (как двойной клик колёсиком мыши)
+    try:
+        com_retry(lambda: target_doc.Activate(), logger=logger)
+        time.sleep(0.3)
+        pythoncom.PumpWaitingMessages()
+        try:
+            com_retry(lambda: acad.ZoomExtents(), logger=logger)
+            log("Выполнен Zoom Extents — чертёж показан целиком", "info")
+        except Exception:
+            com_retry(target_doc.SendCommand, "._ZOOM _E ", logger=logger)
+            log("Выполнен Zoom Extents (через команду)", "info")
+    except Exception as e:
+        log(f"Не удалось выполнить Zoom Extents: {describe_com_error(e)}", "warning")
 
     return {"ok": ok_count, "fail": fail_count, "total_objects": total_objects,
             "errors": errors, "images_ok": images_ok, "images_fail": images_fail}
-
 
 class _NullLogger:
     """Заглушка-логгер для случаев, когда run_merge() вызывают без logging.Logger."""
