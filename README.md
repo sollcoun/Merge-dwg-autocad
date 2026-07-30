@@ -152,4 +152,3 @@ MergeCAD.ico       — иконка приложения
 **MergeCAD**  
 Version 1.0.0  
 Copyright © 2026. Все права защищены.
-```
